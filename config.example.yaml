@@ -1,0 +1,21 @@
+# OrcaLayer Premium API key (required) — https://orcalayer.com/pricing
+api_key: ""
+
+# Wallets to watch (0x addresses)
+wallets:
+  - "0x0000000000000000000000000000000000000000"
+
+# Seconds between polls. 300 = 5 minutes. With N wallets each poll makes
+# 2*N requests; the Premium limit is 600/min.
+poll_interval: 300
+
+# Alert when a position's token size changes by at least this percent.
+alert_threshold_pct: 10
+
+outputs:
+  stdout: true
+  telegram:
+    bot_token: ""   # from @BotFather
+    chat_id: ""     # your chat or channel id
+  discord:
+    webhook_url: ""
