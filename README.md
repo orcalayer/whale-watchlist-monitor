@@ -30,11 +30,31 @@ First run records a baseline silently; alerts start from the second poll.
 
 See [config.example.yaml](config.example.yaml). Telegram needs a bot token from @BotFather and a chat id; Discord needs a channel webhook URL.
 
+The API key can also be passed via the `ORCALAYER_API_KEY` environment variable (takes precedence over the config file) — convenient for systemd units:
+
+```ini
+# /etc/systemd/system/whale-monitor.service
+[Unit]
+Description=Whale watchlist monitor
+After=network-online.target
+
+[Service]
+WorkingDirectory=/opt/whale-watchlist-monitor
+Environment=ORCALAYER_API_KEY=your_key_here
+ExecStart=/usr/bin/python3 monitor.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Picking wallets to watch: the [smart-whale leaderboard](https://orcalayer.com/leaderboard) is a good starting point, or use the `orcalayer` client's `leaderboard()` method.
 
 ## Notes
 
-- State lives in `state.json` next to the script. Delete it to re-baseline.
+- State lives in `state.json` next to the script. Delete it to re-baseline. Wallets removed from the config are dropped from state automatically.
+- Positions are paginated automatically for wallets holding more than 500 open positions.
+- Delivery failures (bad bot token, revoked webhook) are logged with the service's error body; Telegram/Discord rate limits are respected with a retry.
 - Large alert batches are split into multiple messages at alert boundaries, respecting Telegram (4096) and Discord (2000) length limits, with part numbering.
 - `config.yaml` is validated at startup; field-level errors are printed before exit.
 - The monitor makes 2 requests per wallet per poll (single GETs for now; a batch endpoint is planned and the code carries a TODO for it). The Premium limit of 600 requests/min comfortably covers watchlists of dozens of wallets at a 5-minute interval.

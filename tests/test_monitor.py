@@ -5,13 +5,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+
+import monitor  # noqa: E402
 from monitor import (  # noqa: E402
     DISCORD_LIMIT,
     TELEGRAM_LIMIT,
     chunk_alerts,
     diff_wallet,
+    snapshot_wallet,
     validate_config,
 )
+from orcalayer import OrcaLayerError  # noqa: E402
 
 VALID_CFG = {
     "api_key": "orc_test",
@@ -128,3 +134,92 @@ def test_oversize_single_alert_truncated():
     assert len(chunks) == 1
     assert len(chunks[0]) <= DISCORD_LIMIT
     assert chunks[0].endswith("...")
+
+
+def test_telegram_pairing_validation():
+    cfg = {**VALID_CFG, "outputs": {"telegram": {"bot_token": "x", "chat_id": ""}}}
+    errors = validate_config(cfg)
+    assert any("bot_token and chat_id" in e for e in errors)
+    cfg_ok = {**VALID_CFG, "outputs": {"telegram": {"bot_token": "", "chat_id": ""}}}
+    assert validate_config(cfg_ok) == []
+
+
+# ── snapshot_wallet (fake client) ────────────────────────────────────────
+
+
+class FakeClient:
+    def __init__(self, positions_pages):
+        self._pages = positions_pages
+        self._calls = 0
+
+    def wallet_overview(self, wallet):
+        return {"name": "FakeWhale"}
+
+    def wallet_positions(self, wallet, limit=500, offset=0):
+        page = self._pages[self._calls] if self._calls < len(self._pages) else {"positions": []}
+        self._calls += 1
+        return page
+
+
+def full_page(n, start=0):
+    return [
+        {"condition_id": f"cid{start + i}", "side": "token1", "question": "Q?",
+         "outcome": "Yes", "tokens": 10.0, "current_value": 5.0, "avg_entry": 0.5}
+        for i in range(n)
+    ]
+
+
+def test_missing_positions_key_raises_not_empty():
+    client = FakeClient([{"error": "degraded"}])
+    with pytest.raises(OrcaLayerError) as exc:
+        snapshot_wallet(client, "0x" + "a" * 40)
+    assert "positions" in str(exc.value)
+
+
+def test_pagination_collects_all_pages():
+    client = FakeClient([
+        {"positions": full_page(500)},
+        {"positions": full_page(120, start=500)},
+    ])
+    snap = snapshot_wallet(client, "0x" + "a" * 40)
+    assert len(snap["positions"]) == 620
+    assert client._calls == 2
+
+
+# ── delivery error visibility ────────────────────────────────────────────
+
+
+def test_bad_token_logged_not_silent(monkeypatch, caplog):
+    def fake_post(url, json=None, timeout=None):
+        return httpx.Response(
+            401, json={"ok": False, "description": "Unauthorized: bot token invalid"}
+        )
+
+    monkeypatch.setattr(monitor.httpx, "post", fake_post)
+    with caplog.at_level("WARNING"):
+        monitor.send_alerts(
+            ["test alert"],
+            {"stdout": False, "telegram": {"bot_token": "bad", "chat_id": "1"}},
+        )
+    assert any(
+        "telegram send failed" in r.message and "Unauthorized" in r.message
+        for r in caplog.records
+    )
+
+
+def test_429_retried_then_delivered(monkeypatch):
+    calls = []
+
+    def fake_post(url, json=None, timeout=None):
+        calls.append(json)
+        if len(calls) == 1:
+            return httpx.Response(429, json={"ok": False, "parameters": {"retry_after": 0}})
+        return httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(monitor.httpx, "post", fake_post)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: None)
+    monitor.send_alerts(
+        ["test alert"],
+        {"stdout": False, "telegram": {"bot_token": "t", "chat_id": "1"}},
+    )
+    assert len(calls) == 2

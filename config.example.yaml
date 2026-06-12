@@ -1,4 +1,6 @@
 # OrcaLayer Premium API key (required) — https://orcalayer.com/pricing
+# Can also be supplied via the ORCALAYER_API_KEY environment variable,
+# which takes precedence over this value.
 api_key: ""
 
 # Wallets to watch (0x addresses)

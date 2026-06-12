@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import signal
 import sys
@@ -87,6 +88,14 @@ def validate_config(cfg: object) -> list[str]:
         tg = outputs.get("telegram")
         if tg is not None and not isinstance(tg, dict):
             errors.append("outputs.telegram: must be a mapping with bot_token and chat_id")
+        elif isinstance(tg, dict):
+            has_token = bool(str(tg.get("bot_token") or "").strip())
+            has_chat = bool(str(tg.get("chat_id") or "").strip())
+            if has_token != has_chat:
+                errors.append(
+                    "outputs.telegram: bot_token and chat_id must both be set "
+                    "(or both left empty to disable)"
+                )
         discord = outputs.get("discord")
         if discord is not None and not isinstance(discord, dict):
             errors.append("outputs.discord: must be a mapping with webhook_url")
@@ -125,7 +134,25 @@ def snapshot_wallet(client: OrcaLayer, wallet: str) -> dict:
     ships — one request for the whole watchlist instead of 2 per wallet.
     """
     overview = client.wallet_overview(wallet)
-    positions = client.wallet_positions(wallet, limit=500)
+
+    # Paginate until a short page; the API caps at 500 per call.
+    page_limit = 500
+    all_positions: list[dict] = []
+    for page in range(10):  # hard stop at 5,000 positions
+        resp = client.wallet_positions(wallet, limit=page_limit, offset=page * page_limit)
+        if "positions" not in resp:
+            # Malformed/degraded response. Raising (instead of treating it
+            # as "no positions") prevents a flood of false CLOSED alerts
+            # and a state overwrite with an empty snapshot.
+            raise OrcaLayerError(
+                f"positions response missing 'positions' key "
+                f"(got keys: {sorted(resp)[:6]})"
+            )
+        batch = resp["positions"]
+        all_positions.extend(batch)
+        if len(batch) < page_limit:
+            break
+
     name = (
         overview.get("profile", {}).get("name")
         or overview.get("name")
@@ -141,7 +168,7 @@ def snapshot_wallet(client: OrcaLayer, wallet: str) -> dict:
                 "current_value": float(p.get("current_value") or 0),
                 "avg_entry": p.get("avg_entry"),
             }
-            for p in positions.get("positions", [])
+            for p in all_positions
             if float(p.get("tokens") or 0) > 0
         },
     }
@@ -213,35 +240,59 @@ def chunk_alerts(alerts: list[str], limit: int) -> list[str]:
     return chunks
 
 
+def _deliver(service: str, url: str, payload: dict) -> None:
+    """POST one message; on 429 wait the service's retry_after and retry
+    once; on any other non-2xx log the body (Telegram's `description` is
+    the useful part) instead of failing silently."""
+    for attempt in (1, 2):
+        try:
+            resp = httpx.post(url, json=payload, timeout=15)
+        except httpx.HTTPError as exc:
+            logger.warning("%s send failed: %s", service, exc)
+            return
+        if resp.status_code == 429 and attempt == 1:
+            try:
+                body = resp.json()
+                retry_after = float(
+                    body.get("parameters", {}).get("retry_after")  # Telegram
+                    or body.get("retry_after")                     # Discord
+                    or 3
+                )
+            except ValueError:
+                retry_after = 3.0
+            logger.warning("%s rate limited, retrying in %.1fs", service, retry_after)
+            time.sleep(min(retry_after, 60))
+            continue
+        if not (200 <= resp.status_code < 300):
+            logger.warning(
+                "%s send failed: HTTP %s %s", service, resp.status_code, resp.text[:300]
+            )
+        return
+
+
 def send_alerts(alerts: list[str], outputs: dict) -> None:
     if outputs.get("stdout", True):
         print("\n\n".join(alerts), flush=True)
 
     tg = outputs.get("telegram") or {}
     if tg.get("bot_token") and tg.get("chat_id"):
-        for message in chunk_alerts(alerts, TELEGRAM_LIMIT):
-            try:
-                # Plain text (no parse_mode) — market questions may contain
-                # characters that break HTML/Markdown parsing.
-                httpx.post(
-                    f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
-                    json={"chat_id": tg["chat_id"], "text": message},
-                    timeout=15,
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("telegram send failed: %s", exc)
+        for i, message in enumerate(chunk_alerts(alerts, TELEGRAM_LIMIT)):
+            if i:
+                time.sleep(1)  # stay under Telegram's burst limits
+            # Plain text (no parse_mode) — market questions may contain
+            # characters that break HTML/Markdown parsing.
+            _deliver(
+                "telegram",
+                f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+                {"chat_id": tg["chat_id"], "text": message},
+            )
 
     discord = outputs.get("discord") or {}
     if discord.get("webhook_url"):
-        for message in chunk_alerts(alerts, DISCORD_LIMIT):
-            try:
-                httpx.post(
-                    discord["webhook_url"],
-                    json={"content": message},
-                    timeout=15,
-                )
-            except httpx.HTTPError as exc:
-                logger.warning("discord send failed: %s", exc)
+        for i, message in enumerate(chunk_alerts(alerts, DISCORD_LIMIT)):
+            if i:
+                time.sleep(1)
+            _deliver("discord", discord["webhook_url"], {"content": message})
 
 
 # ── Main loop ────────────────────────────────────────────────────────────
@@ -258,6 +309,12 @@ def main() -> None:
         sys.exit("config.yaml not found — copy config.example.yaml and edit it.")
     cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
+    # ORCALAYER_API_KEY env var overrides the config value (handy for
+    # systemd units and CI — keeps the key out of the YAML file).
+    env_key = os.environ.get("ORCALAYER_API_KEY", "").strip()
+    if env_key and isinstance(cfg, dict):
+        cfg["api_key"] = env_key
+
     errors = validate_config(cfg)
     if errors:
         for err in errors:
@@ -271,6 +328,16 @@ def main() -> None:
 
     client = OrcaLayer(api_key=cfg["api_key"])
     state = load_state()
+
+    # Drop state for wallets removed from the config, so a re-added wallet
+    # gets a fresh baseline instead of a flood of stale diffs.
+    stale = set(state) - set(wallets)
+    for wallet in stale:
+        del state[wallet]
+    if stale:
+        logger.info("dropped state for %d wallet(s) no longer in config", len(stale))
+        save_state(state)
+
     running = True
 
     def stop(*_):
@@ -287,6 +354,8 @@ def main() -> None:
 
     while running:
         for wallet in wallets:
+            if not running:
+                break
             try:
                 snap = snapshot_wallet(client, wallet)
             except OrcaLayerError as exc:
