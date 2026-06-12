@@ -12,6 +12,8 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
+import re
 import signal
 import sys
 import time
@@ -24,6 +26,72 @@ from orcalayer import OrcaLayer, OrcaLayerError
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 STATE_PATH = Path(__file__).parent / "state.json"
+
+TELEGRAM_LIMIT = 4096
+DISCORD_LIMIT = 2000
+# Reserve room for a "(NN/NN)\n\n" part header added when a batch splits.
+PART_HEADER_RESERVE = 12
+
+WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+
+logger = logging.getLogger("whale-monitor")
+
+
+# ── Config ───────────────────────────────────────────────────────────────
+
+
+def validate_config(cfg: object) -> list[str]:
+    """Human-readable config errors, empty list when the config is valid."""
+    if not isinstance(cfg, dict):
+        return ["config.yaml: top level must be a mapping (key: value pairs)"]
+    errors: list[str] = []
+
+    api_key = cfg.get("api_key")
+    if not isinstance(api_key, str) or not api_key.strip():
+        errors.append(
+            "api_key: required (string). This tool needs an OrcaLayer Premium "
+            "API key — https://orcalayer.com/pricing"
+        )
+
+    wallets = cfg.get("wallets")
+    if not isinstance(wallets, list) or not wallets:
+        errors.append("wallets: must be a non-empty list of 0x wallet addresses")
+    else:
+        for w in wallets:
+            if not isinstance(w, str) or not WALLET_RE.fullmatch(w.strip()):
+                errors.append(
+                    f"wallets: {w!r} is not a valid address "
+                    "(expected 0x followed by 40 hex characters)"
+                )
+
+    poll = cfg.get("poll_interval", 300)
+    if isinstance(poll, bool) or not isinstance(poll, int) or poll <= 0:
+        errors.append(
+            f"poll_interval: must be a positive integer number of seconds, got {poll!r}"
+        )
+
+    threshold = cfg.get("alert_threshold_pct", 10)
+    if (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or threshold < 0
+    ):
+        errors.append(
+            f"alert_threshold_pct: must be a non-negative number (percent), got {threshold!r}"
+        )
+
+    outputs = cfg.get("outputs", {})
+    if outputs is not None and not isinstance(outputs, dict):
+        errors.append("outputs: must be a mapping (stdout / telegram / discord)")
+    elif isinstance(outputs, dict):
+        tg = outputs.get("telegram")
+        if tg is not None and not isinstance(tg, dict):
+            errors.append("outputs.telegram: must be a mapping with bot_token and chat_id")
+        discord = outputs.get("discord")
+        if discord is not None and not isinstance(discord, dict):
+            errors.append("outputs.discord: must be a mapping with webhook_url")
+
+    return errors
 
 
 # ── State ────────────────────────────────────────────────────────────────
@@ -118,61 +186,90 @@ def diff_wallet(wallet: str, name: str, prev: dict, cur: dict, threshold_pct: fl
 # ── Outputs ──────────────────────────────────────────────────────────────
 
 
-def send_alerts(alerts: list[str], outputs: dict) -> None:
-    text = "\n\n".join(alerts)
+def chunk_alerts(alerts: list[str], limit: int) -> list[str]:
+    """Pack alerts into messages of at most ``limit`` characters.
 
+    Splits only on alert boundaries; a single alert longer than the limit
+    is truncated with an ellipsis. When more than one chunk results, each
+    is prefixed with a part header like ``(2/3)``.
+    """
+    budget = limit - PART_HEADER_RESERVE
+    chunks: list[str] = []
+    current = ""
+    for alert in alerts:
+        if len(alert) > budget:
+            alert = alert[: budget - 3] + "..."
+        if current and len(current) + 2 + len(alert) > budget:
+            chunks.append(current)
+            current = alert
+        else:
+            current = f"{current}\n\n{alert}" if current else alert
+    if current:
+        chunks.append(current)
+
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"({i}/{total})\n\n{c}" for i, c in enumerate(chunks, 1)]
+    return chunks
+
+
+def send_alerts(alerts: list[str], outputs: dict) -> None:
     if outputs.get("stdout", True):
-        print(text, flush=True)
+        print("\n\n".join(alerts), flush=True)
 
     tg = outputs.get("telegram") or {}
     if tg.get("bot_token") and tg.get("chat_id"):
-        try:
-            # Plain text (no parse_mode) — market questions may contain
-            # characters that break HTML/Markdown parsing.
-            httpx.post(
-                f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
-                json={"chat_id": tg["chat_id"], "text": text[:4000]},
-                timeout=15,
-            )
-        except httpx.HTTPError as exc:
-            print(f"[warn] telegram send failed: {exc}", file=sys.stderr)
+        for message in chunk_alerts(alerts, TELEGRAM_LIMIT):
+            try:
+                # Plain text (no parse_mode) — market questions may contain
+                # characters that break HTML/Markdown parsing.
+                httpx.post(
+                    f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+                    json={"chat_id": tg["chat_id"], "text": message},
+                    timeout=15,
+                )
+            except httpx.HTTPError as exc:
+                logger.warning("telegram send failed: %s", exc)
 
     discord = outputs.get("discord") or {}
     if discord.get("webhook_url"):
-        try:
-            httpx.post(
-                discord["webhook_url"],
-                json={"content": text[:1900]},
-                timeout=15,
-            )
-        except httpx.HTTPError as exc:
-            print(f"[warn] discord send failed: {exc}", file=sys.stderr)
+        for message in chunk_alerts(alerts, DISCORD_LIMIT):
+            try:
+                httpx.post(
+                    discord["webhook_url"],
+                    json={"content": message},
+                    timeout=15,
+                )
+            except httpx.HTTPError as exc:
+                logger.warning("discord send failed: %s", exc)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     if not CONFIG_PATH.exists():
         sys.exit("config.yaml not found — copy config.example.yaml and edit it.")
     cfg = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
 
-    api_key = cfg.get("api_key") or ""
-    if not api_key:
-        sys.exit(
-            "api_key missing in config.yaml. This tool requires an OrcaLayer "
-            "Premium API key — https://orcalayer.com/pricing"
-        )
+    errors = validate_config(cfg)
+    if errors:
+        for err in errors:
+            logger.error("config: %s", err)
+        sys.exit(f"config.yaml has {len(errors)} error(s) — see above.")
 
-    wallets = [w.lower() for w in cfg.get("wallets", [])]
-    if not wallets:
-        sys.exit("No wallets configured in config.yaml.")
-
+    wallets = [w.strip().lower() for w in cfg["wallets"]]
     poll_interval = int(cfg.get("poll_interval", 300))
     threshold_pct = float(cfg.get("alert_threshold_pct", 10))
-    outputs = cfg.get("outputs", {})
+    outputs = cfg.get("outputs") or {}
 
-    client = OrcaLayer(api_key=api_key)
+    client = OrcaLayer(api_key=cfg["api_key"])
     state = load_state()
     running = True
 
@@ -183,10 +280,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
 
-    print(
-        f"Watching {len(wallets)} wallet(s), poll every {poll_interval}s, "
-        f"size threshold {threshold_pct}%",
-        flush=True,
+    logger.info(
+        "watching %d wallet(s), poll every %ds, size threshold %s%%",
+        len(wallets), poll_interval, threshold_pct,
     )
 
     while running:
@@ -194,16 +290,15 @@ def main() -> None:
             try:
                 snap = snapshot_wallet(client, wallet)
             except OrcaLayerError as exc:
-                print(f"[warn] {wallet[:10]}: {exc}", file=sys.stderr)
+                logger.warning("%s: %s", wallet[:10], exc)
                 continue
 
             prev = state.get(wallet)
             if prev is None:
                 # First sighting: record baseline silently, no alert flood.
-                print(
-                    f"[init] {snap['name']} ({wallet[:10]}): "
-                    f"{len(snap['positions'])} open position(s) recorded",
-                    flush=True,
+                logger.info(
+                    "%s (%s): baseline of %d open position(s) recorded",
+                    snap["name"], wallet[:10], len(snap["positions"]),
                 )
             else:
                 alerts = diff_wallet(
@@ -220,7 +315,7 @@ def main() -> None:
                 break
             time.sleep(1)
 
-    print("Stopped.", flush=True)
+    logger.info("stopped")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 # whale-watchlist-monitor
 
+[![CI](https://github.com/orcalayer/whale-watchlist-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/orcalayer/whale-watchlist-monitor/actions/workflows/ci.yml)
+
 Watch a list of Polymarket wallets and get alerts when they open, close or resize positions. Built on the [OrcaLayer API](https://orcalayer.com) via the [orcalayer](https://github.com/orcalayer/orcalayer-python) Python client. **Requires an OrcaLayer Premium API key** — get one at [orcalayer.com/pricing](https://orcalayer.com/pricing).
 
 ## What it does
@@ -33,6 +35,8 @@ Picking wallets to watch: the [smart-whale leaderboard](https://orcalayer.com/le
 ## Notes
 
 - State lives in `state.json` next to the script. Delete it to re-baseline.
+- Large alert batches are split into multiple messages at alert boundaries, respecting Telegram (4096) and Discord (2000) length limits, with part numbering.
+- `config.yaml` is validated at startup; field-level errors are printed before exit.
 - The monitor makes 2 requests per wallet per poll (single GETs for now; a batch endpoint is planned and the code carries a TODO for it). The Premium limit of 600 requests/min comfortably covers watchlists of dozens of wallets at a 5-minute interval.
 
 ## Disclaimer
